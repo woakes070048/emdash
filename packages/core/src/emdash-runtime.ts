@@ -22,7 +22,7 @@ import { getAuthMode } from "./auth/mode.js";
 import { getTrustedProxyHeaders } from "./auth/trusted-proxy.js";
 import { isSqlite } from "./database/dialect-helpers.js";
 import { kyselyLogOption } from "./database/instrumentation.js";
-import { runMigrations } from "./database/migrations/runner.js";
+import { MIGRATION_RACE_WAIT_MS, runMigrations } from "./database/migrations/runner.js";
 import { RevisionRepository } from "./database/repositories/revision.js";
 import type { ContentItem as ContentItemInternal } from "./database/repositories/types.js";
 import { validateIdentifier } from "./database/validate.js";
@@ -41,6 +41,7 @@ import type {
 } from "./plugins/types.js";
 import type { FieldType } from "./schema/types.js";
 import { hashString } from "./utils/hash.js";
+import { createInitLock, type InitLock, initWithLock } from "./utils/init-lock.js";
 import { COMMIT, VERSION } from "./version.js";
 
 const LEADING_SLASH_PATTERN = /^\//;
@@ -310,9 +311,38 @@ function contentItemToRecord(item: ContentItemInternal): Record<string, unknown>
 	return { ...item };
 }
 
-// Module-level caches (persist across requests within worker)
-const dbCache = new Map<string, Kysely<Database>>();
-let dbInitPromise: Promise<Kysely<Database>> | null = null;
+/**
+ * Db init lock reclaim deadline. Derived from the migration race wait so
+ * they can't drift apart: a healthy init can legitimately block for the
+ * full MIGRATION_RACE_WAIT_MS inside waitForConcurrentMigrator, plus cold
+ * connect and migrator work, before it should be presumed dead. The outer
+ * runtime init lock (middleware.ts) must use a strictly larger deadline —
+ * it wraps create() → getDatabase() → this lock, and equal deadlines would
+ * let the outer reclaim while the inner is legitimately still working.
+ */
+export const DB_INIT_DEADLINE_MS = MIGRATION_RACE_WAIT_MS + 20_000;
+
+/**
+ * Db cache + its init lock live on globalThis behind a Symbol: the bundler
+ * can duplicate this module across SSR chunks (same reasoning as
+ * request-cache.ts), and a duplicated cache/lock would mean concurrent
+ * independent db inits — and duplicate migrators — per isolate.
+ */
+const DB_HOLDER_KEY = Symbol.for("emdash:db-cache");
+interface DbHolder {
+	cache: Map<string, Kysely<Database>>;
+	lock: InitLock;
+}
+const globalSymbolStore = globalThis as Record<symbol, unknown>;
+function getDbHolder(): DbHolder {
+	// eslint-disable-next-line typescript/no-unsafe-type-assertion -- globalThis symbol slot, written only below
+	let holder = globalSymbolStore[DB_HOLDER_KEY] as DbHolder | undefined;
+	if (!holder) {
+		holder = { cache: new Map<string, Kysely<Database>>(), lock: createInitLock() };
+		globalSymbolStore[DB_HOLDER_KEY] = holder;
+	}
+	return holder;
+}
 const storageCache = new Map<string, Storage>();
 const sandboxedPluginCache = new Map<string, SandboxedPluginInstance>();
 /**
@@ -1270,83 +1300,86 @@ export class EmDashRuntime {
 
 		const cacheKey = dbConfig.entrypoint;
 
-		// Return cached instance if available
-		const cached = dbCache.get(cacheKey);
-		if (cached) {
-			return cached;
-		}
+		// Waiters poll the cache rather than sharing the initializing request's
+		// promise: if the request that owns the init is cancelled mid-await
+		// (e.g. client disconnect during cold migrations), a shared promise
+		// never settles — and the owner's `finally` that would clear it never
+		// runs — deadlocking every later request in the isolate. Prevention:
+		// the in-flight init is anchored via after()/waitUntil so a cancelled
+		// owner's init still completes and populates the cache. Net: a stale
+		// lock is reclaimed after a deadline.
+		const holder = getDbHolder();
+		return initWithLock(
+			holder.lock,
+			() => holder.cache.get(cacheKey),
+			async (isCurrentClaim) => {
+				const dialect = deps.createDialect(dbConfig.config);
+				const db = new Kysely<Database>({ dialect, log: kyselyLogOption() });
 
-		// Use initialization lock to prevent race conditions.
-		// Sharing this promise across requests is safe because the Kysely instance
-		// doesn't hold a request-scoped resource — the DO dialect uses a getStub()
-		// factory that creates a fresh stub per query execution.
-		if (dbInitPromise) {
-			return dbInitPromise;
-		}
+				await runMigrations(db);
 
-		dbInitPromise = (async () => {
-			const dialect = deps.createDialect(dbConfig.config);
-			const db = new Kysely<Database>({ dialect, log: kyselyLogOption() });
+				// Note: legacy installs may carry a stray `emdash:manifest_cache`
+				// row in the options table from versions that persisted a JSON
+				// manifest. The runtime no longer reads or writes it. We do not
+				// proactively delete it: the row is a few hundred bytes of dead
+				// weight and is never on the read path, whereas a one-shot
+				// cleanup-flag check costs an extra `options.get()` on every
+				// isolate cold boot forever. Cheaper to leave it.
 
-			await runMigrations(db);
+				// Auto-seed schema if no collections exist and setup hasn't run.
+				// This covers first-load on sites that skip the setup wizard.
+				// Dev-bypass and the wizard apply seeds explicitly.
+				try {
+					const [collectionCount, setupOption] = await Promise.all([
+						db
+							.selectFrom("_emdash_collections")
+							.select((eb) => eb.fn.countAll<number>().as("count"))
+							.executeTakeFirstOrThrow(),
+						db
+							.selectFrom("options")
+							.select("value")
+							.where("name", "=", "emdash:setup_complete")
+							.executeTakeFirst(),
+					]);
 
-			// Note: legacy installs may carry a stray `emdash:manifest_cache`
-			// row in the options table from versions that persisted a JSON
-			// manifest. The runtime no longer reads or writes it. We do not
-			// proactively delete it: the row is a few hundred bytes of dead
-			// weight and is never on the read path, whereas a one-shot
-			// cleanup-flag check costs an extra `options.get()` on every
-			// isolate cold boot forever. Cheaper to leave it.
+					const setupDone = (() => {
+						try {
+							return setupOption && JSON.parse(setupOption.value) === true;
+						} catch {
+							return false;
+						}
+					})();
 
-			// Auto-seed schema if no collections exist and setup hasn't run.
-			// This covers first-load on sites that skip the setup wizard.
-			// Dev-bypass and the wizard apply seeds explicitly.
-			try {
-				const [collectionCount, setupOption] = await Promise.all([
-					db
-						.selectFrom("_emdash_collections")
-						.select((eb) => eb.fn.countAll<number>().as("count"))
-						.executeTakeFirstOrThrow(),
-					db
-						.selectFrom("options")
-						.select("value")
-						.where("name", "=", "emdash:setup_complete")
-						.executeTakeFirst(),
-				]);
+					if (collectionCount.count === 0 && !setupDone) {
+						const { applySeed } = await import("./seed/apply.js");
+						const { loadSeed } = await import("./seed/load.js");
+						const { validateSeed } = await import("./seed/validate.js");
 
-				const setupDone = (() => {
-					try {
-						return setupOption && JSON.parse(setupOption.value) === true;
-					} catch {
-						return false;
+						const seed = await loadSeed();
+						const validation = validateSeed(seed);
+						if (validation.valid) {
+							await applySeed(db, seed, { onConflict: "skip" });
+							console.log("Auto-seeded default collections");
+						}
 					}
-				})();
-
-				if (collectionCount.count === 0 && !setupDone) {
-					const { applySeed } = await import("./seed/apply.js");
-					const { loadSeed } = await import("./seed/load.js");
-					const { validateSeed } = await import("./seed/validate.js");
-
-					const seed = await loadSeed();
-					const validation = validateSeed(seed);
-					if (validation.valid) {
-						await applySeed(db, seed, { onConflict: "skip" });
-						console.log("Auto-seeded default collections");
-					}
+				} catch {
+					// Tables may not exist yet. Non-fatal.
 				}
-			} catch {
-				// Tables may not exist yet. Non-fatal.
-			}
 
-			dbCache.set(cacheKey, db);
-			return db;
-		})();
-
-		try {
-			return await dbInitPromise;
-		} finally {
-			dbInitPromise = null;
-		}
+				// Publish only while still the current owner: a reclaimed slow
+				// init must not flip the cached Kysely identity back after the
+				// reclaimer has published its own. The unpublished instance is
+				// still returned and fully valid for the request that built it.
+				if (isCurrentClaim()) {
+					holder.cache.set(cacheKey, db);
+				}
+				return db;
+			},
+			{
+				deadlineMs: DB_INIT_DEADLINE_MS,
+				anchor: (promise) => after(() => promise),
+			},
+		);
 	}
 
 	/**
